@@ -707,6 +707,9 @@ export function ShopManager({ variant = "shops" }: ShopManagerProps) {
                       ) : null}
                       <ShopStaffSchedulePanel
                         shopId={s.id}
+                        shopName={s.name}
+                        shops={shops.map((sh) => ({ id: sh.id, name: sh.name }))}
+                        onShopChange={(id) => setExpandedShopId(id)}
                         workTimeMode={schedulingFromShop(s).work_time_mode}
                         shopHours={{
                           opening: schedulingFromShop(s).opening_time,
