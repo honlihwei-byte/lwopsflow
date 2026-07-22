@@ -7,6 +7,20 @@ import type { ShopShiftTemplate } from "../ShopShiftTemplatesPanel";
 import type { ScheduleRow } from "../EditShiftsModal";
 import { OFF_VALUE } from "../ScheduleCellPicker";
 
+export type CrossShopScheduleRow = {
+  id: string;
+  staff_id: string;
+  shift_date: string;
+  shop_id: string;
+  shop_name: string;
+  start_time: string | null;
+  end_time: string | null;
+  break_minutes: number;
+  template_id: string | null;
+  is_off_day: boolean;
+  status: string;
+};
+
 export type ScheduleStaff = {
   id: string;
   staff_name: string;
@@ -108,7 +122,26 @@ export function valueToSyntheticShifts(
   };
 
   if (value === OFF_VALUE || value === "RD" || isScheduleStatusCode(value)) {
-    return [{ ...base, is_off_day: true }];
+    const code = value === OFF_VALUE ? "RD" : value;
+    const schedule_type =
+      code === "NS"
+        ? "NOT_SCHEDULED"
+        : code === "MC"
+          ? "MC"
+          : code === "AL"
+            ? "AL"
+            : code === "UL"
+              ? "UL"
+              : code === "EL"
+                ? "EL"
+                : "RD";
+    return [
+      {
+        ...base,
+        is_off_day: true,
+        schedule_type,
+      } as ScheduleRow,
+    ];
   }
 
   const tpl = templates.find((t) => t.id === value);
@@ -117,10 +150,11 @@ export function valueToSyntheticShifts(
       {
         ...base,
         template_id: tpl.id,
-        start_time: tpl.start_time,
-        end_time: tpl.end_time,
-        break_minutes: tpl.break_minutes,
-      },
+        start_time: tpl.start_time ?? null,
+        end_time: tpl.end_time ?? null,
+        break_minutes: tpl.break_minutes ?? 0,
+        schedule_type: "SHIFT",
+      } as ScheduleRow,
     ];
   }
 

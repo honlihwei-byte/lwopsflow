@@ -15,12 +15,7 @@ import type { ShopShiftTemplate } from "../ShopShiftTemplatesPanel";
 import type { ScheduleRow } from "../EditShiftsModal";
 import { EditShiftsModal } from "../EditShiftsModal";
 import { OFF_VALUE, crossShopConfirmMessage } from "../ScheduleCellPicker";
-import type { CrossShopScheduleRow } from "../ShopStaffSchedulePanel";
-import { ScheduleCell } from "./ScheduleCell";
-import { ScheduleCellPopup } from "./ScheduleCellPopup";
-import { ScheduleContextMenu, type ContextMenuAction } from "./ScheduleContextMenu";
-import { ScheduleDaySummaries, ScheduleEmployeeSummary } from "./ScheduleSummaries";
-import { ScheduleToolbar, type BulkTool } from "./ScheduleToolbar";
+import type { CrossShopScheduleRow, ScheduleStaff } from "./schedule-utils";
 import {
   addDays,
   cellAssignmentValue,
@@ -33,12 +28,16 @@ import {
   parseCellKey,
   readErr,
   todayYmd,
-  type ScheduleStaff,
   valueToSyntheticShifts,
 } from "./schedule-utils";
 import { useScheduleClipboard } from "./useScheduleClipboard";
 import { useScheduleHistory } from "./useScheduleHistory";
 import { useScheduleSelection } from "./useScheduleSelection";
+import { ScheduleCell } from "./ScheduleCell";
+import { ScheduleCellPopup } from "./ScheduleCellPopup";
+import { ScheduleContextMenu, type ContextMenuAction } from "./ScheduleContextMenu";
+import { ScheduleDaySummaries, ScheduleEmployeeSummary } from "./ScheduleSummaries";
+import { ScheduleToolbar, type BulkTool } from "./ScheduleToolbar";
 
 const ROW_HEIGHT = 42;
 const VIRTUAL_BUFFER = 8;
@@ -114,8 +113,8 @@ export function ScheduleWorkspace({
 
   const cellMap = useMemo(() => {
     const grouped = new Map<string, ScheduleRow[]>();
-    for (const r of rows) {
-      if (r.status !== "active") continue;
+    for (const r of rows ?? []) {
+      if (!r || r.status !== "active" || !r.staff_id || !r.shift_date) continue;
       const key = cellKey(r.staff_id, r.shift_date);
       const list = grouped.get(key) ?? [];
       list.push(r);
@@ -135,8 +134,14 @@ export function ScheduleWorkspace({
   const displayCellMap = useMemo(() => {
     const m = new Map(cellMap);
     for (const [key, value] of Object.entries(optimisticAssignments)) {
-      const { staffId, date } = parseCellKey(key);
-      m.set(key, valueToSyntheticShifts(staffId, date, value, templates));
+      if (!key || value == null) continue;
+      try {
+        const { staffId, date } = parseCellKey(key);
+        if (!staffId || !date) continue;
+        m.set(key, valueToSyntheticShifts(staffId, date, value, templates ?? []));
+      } catch {
+        // Ignore malformed optimistic keys rather than crashing the grid.
+      }
     }
     return m;
   }, [cellMap, optimisticAssignments, templates]);
@@ -151,11 +156,13 @@ export function ScheduleWorkspace({
   );
 
   const filteredStaff = useMemo(() => {
-    let list = staff;
+    let list = staff.filter((s) => s && s.id);
     const q = search.trim().toLowerCase();
     if (q) {
       list = list.filter(
-        (s) => s.staff_name.toLowerCase().includes(q) || s.staff_code.toLowerCase().includes(q),
+        (s) =>
+          (s.staff_name ?? "").toLowerCase().includes(q) ||
+          (s.staff_code ?? "").toLowerCase().includes(q),
       );
     }
     if (showFullTimeOnly) {
@@ -212,11 +219,17 @@ export function ScheduleWorkspace({
           templates?: ShopShiftTemplate[];
           shop?: { name?: string };
         };
-        setStaff(j.staff ?? []);
-        setRows(j.rows ?? []);
-        setCrossShopRows(j.crossShopRows ?? []);
+        setStaff(Array.isArray(j.staff) ? j.staff.filter((s) => s && s.id) : []);
+        setRows(Array.isArray(j.rows) ? j.rows.filter((r) => r && r.id) : []);
+        setCrossShopRows(Array.isArray(j.crossShopRows) ? j.crossShopRows : []);
         setCurrentShopName(j.shop?.name ?? shopName);
-        setTemplates(j.templates ?? []);
+        setTemplates(Array.isArray(j.templates) ? j.templates : []);
+        // Drop optimistic entries that the server has caught up with after a full reload.
+        setOptimisticAssignments({});
+        cellSaveSlotsRef.current.clear();
+        setSavingCells(new Set());
+        setSaveStatus("idle");
+        setPickerCell(null);
       } catch (e) {
         const msg = e instanceof Error ? e.message : t("shops.editForm.staffSchedule.saveFailed");
         setError(msg);

@@ -3,19 +3,7 @@
 import { useI18n } from "@/components/i18n/LanguageProvider";
 import { ScheduleWorkspace } from "./schedule/ScheduleWorkspace";
 
-export type CrossShopScheduleRow = {
-  id: string;
-  staff_id: string;
-  shift_date: string;
-  shop_id: string;
-  shop_name: string;
-  start_time: string | null;
-  end_time: string | null;
-  break_minutes: number;
-  template_id: string | null;
-  is_off_day: boolean;
-  status: string;
-};
+export type { CrossShopScheduleRow } from "./schedule/schedule-utils";
 
 export function ShopStaffSchedulePanel({
   shopId,

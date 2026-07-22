@@ -1,7 +1,7 @@
 import type { StaffScheduleRow } from "@/lib/shifts/staff-schedules-db";
 import {
-  getScheduleStatusCode,
   isScheduleStatusCode,
+  resolveScheduleStatusCode,
   type ScheduleStatusCode,
 } from "@/lib/shifts/schedule-off-day";
 
@@ -59,7 +59,9 @@ export function getScheduleType(row: ScheduleTypeRow | null | undefined): Schedu
     }
     return fromColumn;
   }
-  const legacy = getScheduleStatusCode(row);
+  // IMPORTANT: do not call getScheduleStatusCode() here — it calls getScheduleType()
+  // and would recurse infinitely when schedule_type is missing (legacy / optimistic rows).
+  const legacy = resolveScheduleStatusCode(row.start_time, row.end_time, row.is_off_day);
   if (!legacy) {
     return row.start_time?.trim() && row.end_time?.trim() ? "SHIFT" : "NOT_SCHEDULED";
   }

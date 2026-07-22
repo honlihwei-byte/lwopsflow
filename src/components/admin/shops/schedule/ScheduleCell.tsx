@@ -5,7 +5,7 @@ import { useI18n } from "@/components/i18n/LanguageProvider";
 import { buildCellView, type CellVisualState } from "@/lib/shifts/schedule-cell-status";
 import type { ShopShiftTemplate } from "../ShopShiftTemplatesPanel";
 import type { ScheduleRow } from "../EditShiftsModal";
-import type { CrossShopScheduleRow } from "../ShopStaffSchedulePanel";
+import type { CrossShopScheduleRow } from "./schedule-utils";
 import {
   cellAssignmentValue,
   detectCellConflicts,
