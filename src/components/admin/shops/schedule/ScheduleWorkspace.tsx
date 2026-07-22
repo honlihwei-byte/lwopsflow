@@ -2,6 +2,8 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useI18n } from "@/components/i18n/LanguageProvider";
+import { Toast } from "@/components/Toast";
+import { useAdminToast } from "@/components/admin/useAdminToast";
 import { formatTemplate } from "@/lib/i18n/format-template";
 import {
   buildCellView,
@@ -28,9 +30,11 @@ import {
   findTemplateByName,
   isWeekend,
   mondayOfWeek,
+  parseCellKey,
   readErr,
   todayYmd,
   type ScheduleStaff,
+  valueToSyntheticShifts,
 } from "./schedule-utils";
 import { useScheduleClipboard } from "./useScheduleClipboard";
 import { useScheduleHistory } from "./useScheduleHistory";
@@ -38,6 +42,11 @@ import { useScheduleSelection } from "./useScheduleSelection";
 
 const ROW_HEIGHT = 42;
 const VIRTUAL_BUFFER = 8;
+
+type CellSaveSlot = {
+  inFlight: boolean;
+  revertValue: string;
+};
 
 export function ScheduleWorkspace({
   shopId,
@@ -51,6 +60,7 @@ export function ScheduleWorkspace({
   onShopChange?: (id: string) => void;
 }) {
   const { t } = useI18n();
+  const { toast, showError, dismiss } = useAdminToast();
   const today = todayYmd();
   const [weekStart, setWeekStart] = useState(() => mondayOfWeek(today));
   const [staff, setStaff] = useState<ScheduleStaff[]>([]);
@@ -63,7 +73,8 @@ export function ScheduleWorkspace({
   const [search, setSearch] = useState("");
   const [showActiveOnly, setShowActiveOnly] = useState(true);
   const [showFullTimeOnly, setShowFullTimeOnly] = useState(false);
-  const [savingCellKey, setSavingCellKey] = useState<string | null>(null);
+  const [savingCells, setSavingCells] = useState<Set<string>>(() => new Set());
+  const [optimisticAssignments, setOptimisticAssignments] = useState<Record<string, string>>({});
   const [saveStatus, setSaveStatus] = useState<"idle" | "saving" | "saved">("idle");
   const [pickerCell, setPickerCell] = useState<{ staffId: string; date: string; rect: DOMRect } | null>(null);
   const [editModal, setEditModal] = useState<{ staffId: string; staffName: string; date: string } | null>(null);
@@ -74,6 +85,14 @@ export function ScheduleWorkspace({
   const [scrollTop, setScrollTop] = useState(0);
   const [viewportHeight, setViewportHeight] = useState(500);
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const cellSaveSlotsRef = useRef<Map<string, CellSaveSlot>>(new Map());
+  const optimisticAssignmentsRef = useRef(optimisticAssignments);
+  const cellMapRef = useRef(new Map<string, ScheduleRow[]>());
+  const templatesRef = useRef<ShopShiftTemplate[]>([]);
+
+  useEffect(() => {
+    optimisticAssignmentsRef.current = optimisticAssignments;
+  }, [optimisticAssignments]);
 
   const history = useScheduleHistory();
   const clipboard = useScheduleClipboard();
@@ -104,6 +123,32 @@ export function ScheduleWorkspace({
     }
     return grouped;
   }, [rows]);
+
+  useEffect(() => {
+    cellMapRef.current = cellMap;
+  }, [cellMap]);
+
+  useEffect(() => {
+    templatesRef.current = templates;
+  }, [templates]);
+
+  const displayCellMap = useMemo(() => {
+    const m = new Map(cellMap);
+    for (const [key, value] of Object.entries(optimisticAssignments)) {
+      const { staffId, date } = parseCellKey(key);
+      m.set(key, valueToSyntheticShifts(staffId, date, value, templates));
+    }
+    return m;
+  }, [cellMap, optimisticAssignments, templates]);
+
+  const getEffectiveAssignment = useCallback(
+    (key: string) => {
+      if (key in optimisticAssignments) return optimisticAssignments[key]!;
+      const shifts = cellMap.get(key) ?? [];
+      return cellAssignmentValue(shifts, templates);
+    },
+    [optimisticAssignments, cellMap, templates],
+  );
 
   const filteredStaff = useMemo(() => {
     let list = staff;
@@ -239,7 +284,7 @@ export function ScheduleWorkspace({
     staffId: string,
     date: string,
     body: Record<string, unknown>,
-  ): Promise<void> {
+  ): Promise<ScheduleRow> {
     const res = await fetch(`/api/shops/${encodeURIComponent(shopId)}/staff-schedule`, {
       method: "POST",
       credentials: "include",
@@ -247,24 +292,147 @@ export function ScheduleWorkspace({
       body: JSON.stringify({ staff_id: staffId, shift_date: date, ...body }),
     });
     if (!res.ok) throw new Error(await readErr(res));
+    const j = (await res.json()) as { row?: ScheduleRow };
+    if (!j.row) throw new Error("No row returned");
+    return j.row;
   }
+
+  const patchRowFromServer = useCallback((row: ScheduleRow) => {
+    setRows((prev) => {
+      const rest = prev.filter(
+        (r) =>
+          !(
+            r.staff_id === row.staff_id &&
+            r.shift_date === row.shift_date &&
+            r.status === "active"
+          ),
+      );
+      return [...rest, row];
+    });
+  }, []);
+
+  const setCellSaving = useCallback((key: string, saving: boolean) => {
+    setSavingCells((prev) => {
+      const next = new Set(prev);
+      if (saving) next.add(key);
+      else next.delete(key);
+      setSaveStatus(next.size > 0 ? "saving" : "idle");
+      return next;
+    });
+  }, []);
 
   const markSaved = useCallback(() => {
     setSaveStatus("saved");
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
-    saveTimerRef.current = setTimeout(() => setSaveStatus("idle"), 2000);
+    saveTimerRef.current = setTimeout(() => {
+      setSaveStatus((prev) => (prev === "saved" ? "idle" : prev));
+    }, 2000);
   }, []);
+
+  const runCellSave = useCallback(
+    async (staffId: string, date: string, value: string, revertValue: string) => {
+      const key = cellKey(staffId, date);
+      const slots = cellSaveSlotsRef.current;
+      let slot = slots.get(key);
+      if (!slot) {
+        slot = { inFlight: false, revertValue };
+        slots.set(key, slot);
+      }
+
+      if (slot.inFlight) return;
+
+      slot.inFlight = true;
+      setCellSaving(key, true);
+
+      let succeeded = false;
+      try {
+        let row: ScheduleRow;
+        if (value === OFF_VALUE || value === "RD") {
+          row = await postSchedule(staffId, date, { is_off_day: true, leave_code: "RD" });
+        } else if (value === "NS") {
+          row = await postSchedule(staffId, date, { is_off_day: true, leave_code: "NS" });
+        } else if (isScheduleStatusCode(value)) {
+          row = await postSchedule(staffId, date, { is_off_day: true, leave_code: value });
+        } else {
+          const existing = cellMapRef.current.get(key) ?? [];
+          row = await postSchedule(staffId, date, {
+            template_id: value,
+            is_off_day: false,
+            add: cellHasTimedShifts(existing),
+          });
+        }
+
+        patchRowFromServer(row);
+        setOptimisticAssignments((prev) => {
+          if (prev[key] !== value) return prev;
+          const { [key]: _removed, ...rest } = prev;
+          return rest;
+        });
+        succeeded = true;
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : t("shops.editForm.staffSchedule.saveFailed");
+        setOptimisticAssignments((prev) => {
+          if (prev[key] !== value) return prev;
+          if (!revertValue) {
+            const { [key]: _removed, ...rest } = prev;
+            return rest;
+          }
+          return { ...prev, [key]: revertValue };
+        });
+        showError(msg);
+      } finally {
+        slot.inFlight = false;
+        setSavingCells((prev) => {
+          const next = new Set(prev);
+          next.delete(key);
+          if (succeeded && next.size === 0) {
+            markSaved();
+          } else if (next.size > 0) {
+            setSaveStatus("saving");
+          } else if (!succeeded) {
+            setSaveStatus("idle");
+          }
+          return next;
+        });
+
+        const pendingValue = optimisticAssignmentsRef.current[key];
+        const rowsValue = cellAssignmentValue(
+          cellMapRef.current.get(key) ?? [],
+          templatesRef.current,
+        );
+        if (pendingValue !== undefined && pendingValue !== rowsValue) {
+          void runCellSave(staffId, date, pendingValue, rowsValue);
+        } else {
+          cellSaveSlotsRef.current.delete(key);
+        }
+      }
+    },
+    [markSaved, patchRowFromServer, setCellSaving, showError, t],
+  );
 
   const assignValue = useCallback(
     async (
       staffId: string,
       date: string,
       value: string,
-      opts?: { skipReload?: boolean; trackHistory?: boolean },
+      opts?: { trackHistory?: boolean },
     ) => {
       const key = cellKey(staffId, date);
-      const current = cellAssignmentValue(cellMap.get(key) ?? [], templates);
+      const current = getEffectiveAssignment(key);
       if (value === current) return;
+
+      const slot = cellSaveSlotsRef.current.get(key);
+      if (slot?.inFlight) {
+        setOptimisticAssignments((prev) => ({ ...prev, [key]: value }));
+        return;
+      }
+
+      if (value && !isScheduleStatusCode(value) && value !== OFF_VALUE && value !== "RD" && value !== "NS") {
+        const tpl = templates.find((item) => item.id === value);
+        if (!(await confirmCrossShopIfNeeded(staffId, date, tpl ?? null, false))) return;
+      }
+
+      const revertValue = current;
 
       if (opts?.trackHistory !== false) {
         history.pushAction({
@@ -273,51 +441,21 @@ export function ScheduleWorkspace({
         });
       }
 
-      setSavingCellKey(key);
-      setSaveStatus("saving");
-      try {
-        if (value === OFF_VALUE || value === "RD") {
-          await postSchedule(staffId, date, { is_off_day: true, leave_code: "RD" });
-        } else if (value === "NS") {
-          await postSchedule(staffId, date, { is_off_day: true, leave_code: "NS" });
-        } else if (isScheduleStatusCode(value)) {
-          await postSchedule(staffId, date, { is_off_day: true, leave_code: value });
-        } else if (value) {
-          const tpl = templates.find((item) => item.id === value);
-          if (!(await confirmCrossShopIfNeeded(staffId, date, tpl ?? null, false))) return;
-          const existing = cellMap.get(key) ?? [];
-          await postSchedule(staffId, date, {
-            template_id: value,
-            is_off_day: false,
-            add: cellHasTimedShifts(existing),
-          });
-        }
-        if (!opts?.skipReload) await load({ silent: true });
-        markSaved();
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : t("shops.editForm.staffSchedule.saveFailed");
-        setError(msg);
-        setSaveStatus("idle");
-      } finally {
-        setSavingCellKey((k) => (k === key ? null : k));
-      }
+      setOptimisticAssignments((prev) => ({ ...prev, [key]: value }));
+      void runCellSave(staffId, date, value, revertValue);
     },
-    [cellMap, templates, history, load, markSaved, t],
+    [getEffectiveAssignment, history, runCellSave, templates, t],
   );
 
   const assignToMany = useCallback(
-    async (cells: Array<{ staffId: string; date: string; value: string }>) => {
+    (cells: Array<{ staffId: string; date: string; value: string }>) => {
       history.startBatch();
       for (const cell of cells) {
-        await assignValue(cell.staffId, cell.date, cell.value, {
-          skipReload: true,
-          trackHistory: true,
-        });
+        void assignValue(cell.staffId, cell.date, cell.value, { trackHistory: true });
       }
       history.commitBatch();
-      await load({ silent: true });
     },
-    [assignValue, history, load],
+    [assignValue, history],
   );
 
   useEffect(() => {
@@ -343,10 +481,11 @@ export function ScheduleWorkspace({
   }, [isDragging, selection, assignToMany]);
 
   const handleSelect = useCallback(
-    async (value: string) => {
+    (value: string) => {
       if (!pickerCell) return;
+      const { staffId, date } = pickerCell;
       setPickerCell(null);
-      await assignValue(pickerCell.staffId, pickerCell.date, value);
+      void assignValue(staffId, date, value);
     },
     [pickerCell, assignValue],
   );
@@ -449,7 +588,7 @@ export function ScheduleWorkspace({
           return {
             staffId: sid!,
             date: d!,
-            value: cellAssignmentValue(cellMap.get(k) ?? [], templates),
+            value: getEffectiveAssignment(k),
           };
         });
         const cells =
@@ -459,7 +598,7 @@ export function ScheduleWorkspace({
                 {
                   staffId,
                   date,
-                  value: cellAssignmentValue(cellMap.get(cellKey(staffId, date)) ?? [], templates),
+                  value: getEffectiveAssignment(cellKey(staffId, date)),
                 },
               ];
         clipboard.copy(buildClipboardData(anchor, cells));
@@ -525,6 +664,7 @@ export function ScheduleWorkspace({
       handleBulkTool,
       buildClipboardData,
       pasteAt,
+      getEffectiveAssignment,
     ],
   );
 
@@ -549,7 +689,7 @@ export function ScheduleWorkspace({
             return {
               staffId: sid!,
               date: d!,
-              value: cellAssignmentValue(cellMap.get(k) ?? [], templates),
+              value: getEffectiveAssignment(k),
             };
           });
           const cells =
@@ -559,7 +699,7 @@ export function ScheduleWorkspace({
                   {
                     staffId,
                     date,
-                    value: cellAssignmentValue(cellMap.get(cellKey(staffId, date)) ?? [], templates),
+                    value: getEffectiveAssignment(cellKey(staffId, date)),
                   },
                 ];
           clipboard.copy(buildClipboardData({ staffId, date }, cells));
@@ -638,7 +778,7 @@ export function ScheduleWorkspace({
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [selection, cellMap, templates, clipboard, assignToMany, assignValue, history, buildClipboardData, pasteAt]);
+  }, [selection, templates, clipboard, assignToMany, assignValue, history, buildClipboardData, pasteAt, getEffectiveAssignment]);
 
   const startIndex = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - VIRTUAL_BUFFER);
   const endIndex = Math.min(
@@ -650,7 +790,7 @@ export function ScheduleWorkspace({
   const bottomSpacer = Math.max(0, (filteredStaff.length - endIndex) * ROW_HEIGHT);
 
   const modalShifts = editModal
-    ? (cellMap.get(cellKey(editModal.staffId, editModal.date)) ?? [])
+    ? (displayCellMap.get(cellKey(editModal.staffId, editModal.date)) ?? [])
     : [];
   const modalOther = editModal ? otherAssignmentsFor(editModal.staffId, editModal.date) : [];
 
@@ -708,7 +848,7 @@ export function ScheduleWorkspace({
           <ScheduleDaySummaries
             weekDays={weekDays}
             staffIds={staffIds}
-            cellMap={cellMap}
+            cellMap={displayCellMap}
             templates={templates}
             today={today}
           />
@@ -764,9 +904,9 @@ export function ScheduleWorkspace({
                   </div>
                   {weekDays.map((d) => {
                     const key = cellKey(s.id, d);
-                    const cellShifts = cellMap.get(key) ?? [];
+                    const cellShifts = displayCellMap.get(key) ?? [];
                     const coord = { staffId: s.id, date: d };
-                    const isSaving = savingCellKey === key;
+                    const isSaving = savingCells.has(key);
 
                     return (
                       <div
@@ -814,7 +954,7 @@ export function ScheduleWorkspace({
                           }}
                           onMouseDown={(e) => {
                             if (e.button !== 0) return;
-                            const value = cellAssignmentValue(cellShifts, templates);
+                            const value = getEffectiveAssignment(key);
                             setIsDragging(true);
                             selection.startDragFill({ staffId: s.id, date: d, value });
                           }}
@@ -831,7 +971,7 @@ export function ScheduleWorkspace({
                   <ScheduleEmployeeSummary
                     staffId={s.id}
                     weekDays={weekDays}
-                    cellMap={cellMap}
+                    cellMap={displayCellMap}
                     templates={templates}
                   />
                 </div>
@@ -846,14 +986,14 @@ export function ScheduleWorkspace({
         open={pickerCell != null}
         currentValue={
           pickerCell
-            ? cellAssignmentValue(cellMap.get(cellKey(pickerCell.staffId, pickerCell.date)) ?? [], templates)
+            ? getEffectiveAssignment(cellKey(pickerCell.staffId, pickerCell.date))
             : ""
         }
         otherAssignments={
           pickerCell ? otherAssignmentsFor(pickerCell.staffId, pickerCell.date) : []
         }
         templates={templates}
-        busy={savingCellKey != null}
+        busy={false}
         anchorRect={pickerCell?.rect ?? null}
         onSelect={(v) => void handleSelect(v)}
         onCustom={() => {
@@ -885,16 +1025,19 @@ export function ScheduleWorkspace({
         shifts={modalShifts}
         otherAssignments={modalOther}
         templates={templates}
-        busy={savingCellKey != null}
+        busy={
+          editModal != null && savingCells.has(cellKey(editModal.staffId, editModal.date))
+        }
         onClose={() => setEditModal(null)}
         onReplaceShift={(templateId) => {
           if (!editModal) return;
-          void assignValue(editModal.staffId, editModal.date, templateId).then(() =>
-            setEditModal(null),
-          );
+          setEditModal(null);
+          void assignValue(editModal.staffId, editModal.date, templateId);
         }}
         onMarkOff={() => {
-          if (editModal) void assignValue(editModal.staffId, editModal.date, "RD").then(() => setEditModal(null));
+          if (!editModal) return;
+          setEditModal(null);
+          void assignValue(editModal.staffId, editModal.date, "RD");
         }}
         onDelete={async (id) => {
           try {
@@ -906,10 +1049,12 @@ export function ScheduleWorkspace({
             await load({ silent: true });
             markSaved();
           } catch (e) {
-            setError(e instanceof Error ? e.message : t("shops.editForm.staffSchedule.saveFailed"));
+            showError(e instanceof Error ? e.message : t("shops.editForm.staffSchedule.saveFailed"));
           }
         }}
       />
+
+      <Toast message={toast?.message ?? null} variant={toast?.variant} onDismiss={dismiss} />
     </div>
   );
 }

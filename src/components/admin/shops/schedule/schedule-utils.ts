@@ -55,12 +55,6 @@ export function parseCellKey(key: string): CellCoord {
   return { staffId: staffId!, date: date! };
 }
 
-export function cellHasTimedShifts(shifts: ScheduleRow[]): boolean {
-  return (shifts as StaffScheduleRow[]).some(
-    (s) => s.status === "active" && getScheduleType(s) === "SHIFT" && s.start_time && s.end_time,
-  );
-}
-
 export function cellAssignmentValue(shifts: ScheduleRow[], templates: ShopShiftTemplate[]): string {
   const active = allActiveScheduleRows(shifts as StaffScheduleRow[]);
   if (active.length === 0) return "";
@@ -84,6 +78,53 @@ export function cellAssignmentValue(shifts: ScheduleRow[], templates: ShopShiftT
     if (byTimes) return byTimes.id;
   }
   return canonical.template_id ?? "";
+}
+
+export function cellHasTimedShifts(shifts: ScheduleRow[]): boolean {
+  return (shifts as StaffScheduleRow[]).some(
+    (s) => s.status === "active" && getScheduleType(s) === "SHIFT" && s.start_time && s.end_time,
+  );
+}
+
+/** Build display rows for optimistic assignment before the server responds. */
+export function valueToSyntheticShifts(
+  staffId: string,
+  date: string,
+  value: string,
+  templates: ShopShiftTemplate[],
+): ScheduleRow[] {
+  if (!value || value === "NS") return [];
+
+  const base: ScheduleRow = {
+    id: `optimistic:${staffId}:${date}`,
+    staff_id: staffId,
+    shift_date: date,
+    start_time: null,
+    end_time: null,
+    break_minutes: 0,
+    template_id: null,
+    is_off_day: false,
+    status: "active",
+  };
+
+  if (value === OFF_VALUE || value === "RD" || isScheduleStatusCode(value)) {
+    return [{ ...base, is_off_day: true }];
+  }
+
+  const tpl = templates.find((t) => t.id === value);
+  if (tpl) {
+    return [
+      {
+        ...base,
+        template_id: tpl.id,
+        start_time: tpl.start_time,
+        end_time: tpl.end_time,
+        break_minutes: tpl.break_minutes,
+      },
+    ];
+  }
+
+  return [];
 }
 
 export function findTemplateByName(
