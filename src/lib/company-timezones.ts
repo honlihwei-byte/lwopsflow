@@ -1,0 +1,20 @@
+/** Common IANA timezones for company profile (attendance uses Malaysia by default). */
+export const COMPANY_TIMEZONE_OPTIONS = [
+  "Asia/Kuala_Lumpur",
+  "Asia/Singapore",
+  "Asia/Bangkok",
+  "Asia/Jakarta",
+  "Asia/Manila",
+  "Asia/Hong_Kong",
+  "Asia/Taipei",
+  "Asia/Shanghai",
+  "Asia/Tokyo",
+  "Asia/Seoul",
+  "Asia/Kolkata",
+  "Asia/Dubai",
+  "Australia/Perth",
+  "Australia/Sydney",
+  "Pacific/Auckland",
+  "Europe/London",
+  "UTC",
+] as const;

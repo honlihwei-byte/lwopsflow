@@ -1,0 +1,62 @@
+import { NextResponse } from "next/server";
+import { isNextResponse, requireEmployeeSession } from "@/lib/employee-api-auth";
+import { resolveEmployeeClockContext } from "@/lib/employee-clock-context";
+import {
+  acknowledgeOperationsContent,
+  getEmployeeOperationsDetail,
+} from "@/lib/operations-center/db";
+import { createAdminClient } from "@/lib/supabase/admin";
+
+type RouteCtx = { params: Promise<{ id: string }> };
+
+function deviceInfo(req: Request): string {
+  return req.headers.get("user-agent")?.slice(0, 500) ?? "";
+}
+
+export async function POST(req: Request, ctx: RouteCtx) {
+  try {
+    const { id } = await ctx.params;
+    const supabase = createAdminClient();
+    const actor = await requireEmployeeSession(req, supabase);
+    if (isNextResponse(actor)) return actor;
+
+    const clockContext = await resolveEmployeeClockContext(supabase, {
+      staff_id: actor.staffId,
+      company_id: actor.companyId,
+    });
+    const shopId =
+      clockContext.selected_shop_id ||
+      clockContext.assigned_shops[0]?.id ||
+      clockContext.accessible_shops[0]?.id ||
+      null;
+    if (!shopId) {
+      return NextResponse.json({ error: "No shop assigned." }, { status: 403 });
+    }
+
+    const item = await getEmployeeOperationsDetail(supabase, {
+      companyId: actor.companyId,
+      staffId: actor.staffId,
+      contentId: id,
+      shopId,
+    });
+    if (!item) {
+      return NextResponse.json({ error: "Not found" }, { status: 404 });
+    }
+
+    const result = await acknowledgeOperationsContent(supabase, {
+      contentId: id,
+      staffId: actor.staffId,
+      shopId,
+      deviceInfo: deviceInfo(req),
+      content: item,
+    });
+    if (!result.ok) {
+      return NextResponse.json({ error: result.error }, { status: 400 });
+    }
+
+    return NextResponse.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    return NextResponse.json({ error: e instanceof Error ? e.message : "Server error" }, { status: 500 });
+  }
+}
